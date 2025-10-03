@@ -1,0 +1,60 @@
+# .github/workflows/apply-patch.yml
+name: Apply Patch from Comment
+
+on:
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  apply:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/apply')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '/apply'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract patch from comment
+        id: extract
+        run: |
+          BODY=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH")
+          awk '
+            BEGIN{inblk=0}
+            /^```(patch|diff)[[:space:]]*$/ {inblk=1; next}
+            /^```[[:space:]]*$/ {if(inblk){inblk=0; exit}}
+            { if(inblk) print }
+          ' <<< "$BODY" > /tmp/patch.diff
+          if [ ! -s /tmp/patch.diff ]; then
+            echo "::error::No ```patch or ```diff block found after /apply"
+            exit 1
+          fi
+          echo "patch=/tmp/patch.diff" >> "$GITHUB_OUTPUT"
+
+      - name: Create working branch
+        run: |
+          BASE="${{ github.event.repository.default_branch }}"
+          BR="chatops/apply-${{ github.run_id }}"
+          git switch -c "$BR" "origin/$BASE" || git switch -c "$BR"
+
+      - name: Apply patch
+        run: |
+          set -e
+          git apply --index -p1 "${{ steps.extract.outputs.patch }}" || git apply --index -p0 "${{ steps.extract.outputs.patch }}"
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "Apply patch from comment by @${{ github.actor }}"
+          title: "Apply patch from comment by @${{ github.actor }}"
+          body: "Applied via workflow from comment: ${{ github.event.comment.html_url }}"
+          branch: "chatops/apply-${{ github.run_id }}"
+          base: "${{ github.event.repository.default_branch }}"
