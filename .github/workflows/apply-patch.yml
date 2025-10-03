@@ -1,4 +1,3 @@
-# .github/workflows/apply-patch.yml
 name: Apply Patch from Comment
 
 on:
@@ -14,6 +13,7 @@ permissions:
 
 jobs:
   apply:
+    # Only run when comment contains /apply
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/apply')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '/apply'))
@@ -23,24 +23,32 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Robust extraction that works from mobile comments, no jq/awk required
       - name: Extract patch from comment
         id: extract
-        run: |
-          BODY=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH")
-          awk '
-            BEGIN{inblk=0}
-            /^```(patch|diff)[[:space:]]*$/ {inblk=1; next}
-            /^```[[:space:]]*$/ {if(inblk){inblk=0; exit}}
-            { if(inblk) print }
-          ' <<< "$BODY" > /tmp/patch.diff
-          if [ ! -s /tmp/patch.diff ]; then
-            echo "::error::No ```patch or ```diff block found after /apply"
-            exit 1
-          fi
-          echo "patch=/tmp/patch.diff" >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const body = (context.payload.comment && context.payload.comment.body) ? context.payload.comment.body : '';
+            if (!body || !body.includes('/apply')) {
+              core.setFailed('No /apply trigger in comment');
+              return;
+            }
+            const m = body.match(/```(?:patch|diff)\s*\n([\s\S]*?)\n```/i);
+            if (!m) {
+              core.setFailed('No ```patch or ```diff fenced block found after /apply');
+              return;
+            }
+            const out = path.join(process.env.RUNNER_TEMP, 'patch.diff');
+            fs.writeFileSync(out, m[1], 'utf8');
+            core.info(`Wrote patch to ${out}`);
+            core.setOutput('patch', out);
 
       - name: Create working branch
         run: |
+          set -e
           BASE="${{ github.event.repository.default_branch }}"
           BR="chatops/apply-${{ github.run_id }}"
           git switch -c "$BR" "origin/$BASE" || git switch -c "$BR"
@@ -48,7 +56,9 @@ jobs:
       - name: Apply patch
         run: |
           set -e
+          # Try with and without a/ b/ prefixes
           git apply --index -p1 "${{ steps.extract.outputs.patch }}" || git apply --index -p0 "${{ steps.extract.outputs.patch }}"
+          echo "Patch applied and staged."
 
       - name: Create PR
         uses: peter-evans/create-pull-request@v6
